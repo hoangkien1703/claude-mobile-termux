@@ -1,0 +1,58 @@
+{
+  "name": "claude-mobile-termux",
+  "version": "1.0.0",
+  "description": "Install and run Claude Code on ARM64 Android phones using Termux and tmux.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "termux",
+    "android",
+    "arm64",
+    "tmux"
+  ],
+  "license": "MIT",
+  "author": "Hoang Trung Kien",
+  "homepage": "https://github.com/hoangkien1703/claude-mobile-termux#readme",
+  "bugs": {
+    "url": "https://github.com/hoangkien1703/claude-mobile-termux/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hoangkien1703/claude-mobile-termux.git"
+  },
+  "bin": {
+    "claude-mobile-termux": "npm-bin/install.js"
+  },
+  "files": [
+    "bin",
+    "npm-bin",
+    "install.sh",
+    "uninstall.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "android"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check:syntax": "bash -n install.sh uninstall.sh bin/* tests/*.sh && node --check npm-bin/install.js",
+    "lint:shell": "shellcheck install.sh uninstall.sh bin/* tests/*.sh",
+    "test": "npm run test:launchers && npm run test:runtime && npm run test:installer",
+    "test:launchers": "bash tests/test-launchers.sh",
+    "test:runtime": "bash tests/test-runtime.sh",
+    "test:installer": "bash tests/test-installer.sh",
+    "test:package": "bash tests/test-package.sh",
+    "check:package": "npm pack --dry-run",
+    "validate": "npm run check:syntax && npm run lint:shell && npm test && npm run test:package && npm run check:package",
+    "prepublishOnly": "npm run validate"
+  }
+}

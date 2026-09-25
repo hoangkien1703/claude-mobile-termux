@@ -1,0 +1,7 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Continue the most recent Claude Code conversation in the current directory,
+# inside the persistent mobile session.
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+exec "$BASH" "$SCRIPT_DIR/claude-mobile" --claude-mobile-continue "$@"
