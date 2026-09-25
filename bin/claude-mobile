@@ -1,0 +1,153 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Claude Mobile for Termux launcher.
+# Run the patched Claude Code binary in a persistent, phone-friendly tmux session.
+set -Eeuo pipefail
+
+# A tmux server that is already running does not pass the caller's environment
+# to new sessions, so forward this launcher's own settings explicitly. Secrets
+# such as ANTHROPIC_API_KEY are deliberately not forwarded on the command line.
+tmux_env=()
+for name in CLAUDE_MOBILE_NATIVE CLAUDE_MOBILE_ROOT CLAUDE_MOBILE_RUNTIME \
+  CLAUDE_MOBILE_DNS CLAUDE_MOBILE_SKIP_UPDATE CLAUDE_MOBILE_CHANNEL \
+  CLAUDE_MOBILE_UPDATE_HOURS CLAUDE_MOBILE_UPDATE_TIMEOUT \
+  CLAUDE_MOBILE_DOWNLOAD_TIMEOUT CLAUDE_MOBILE_SMOKE_TIMEOUT; do
+  if [[ -n "${!name+x}" ]]; then
+    tmux_env+=(-e "$name=${!name}")
+  fi
+done
+
+SESSION_NAME="${CLAUDE_MOBILE_SESSION:-claude}"
+CLAUDE_MOBILE_ROOT="${CLAUDE_MOBILE_ROOT:-$HOME/.local/claude-termux}"
+NATIVE_OVERRIDDEN="${CLAUDE_MOBILE_NATIVE+x}"
+CLAUDE_MOBILE_NATIVE="${CLAUDE_MOBILE_NATIVE:-$CLAUDE_MOBILE_ROOT/current}"
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname -- "$SELF")"
+RUNTIME="${CLAUDE_MOBILE_RUNTIME:-$SCRIPT_DIR/claude-mobile-runtime}"
+# Private flag used by claude-mobile-resume. It is not a Claude Code option, so
+# it cannot collide with Claude's own --resume and --continue flags.
+CONTINUE_FLAG='--claude-mobile-continue'
+export CLAUDE_MOBILE_ROOT
+
+run_runtime() {
+  if [[ ! -f "$RUNTIME" ]]; then
+    printf 'Runtime manager not found: %s\nRun the repository install.sh script again.\n' \
+      "$RUNTIME" >&2
+    exit 1
+  fi
+  "$BASH" "$RUNTIME" "$@"
+}
+
+# Claude's own updater would install an unpatched glibc build, so updates and
+# installs go through the runtime manager instead.
+case "${1:-}" in
+  update|upgrade)
+    shift
+    run_runtime update --force
+    exit
+    ;;
+  install)
+    shift
+    run_runtime install "$@"
+    exit
+    ;;
+esac
+
+launch_args=("$@")
+continue_last=0
+if [[ "${1:-}" == "$CONTINUE_FLAG" ]]; then
+  continue_last=1
+  shift
+fi
+
+# One-shot commands print output and exit, so they run directly: inside a new
+# tmux session their output would disappear when the session closed.
+interactive=1
+case "${1:-}" in
+  mcp|config|doctor|setup-token|auth|plugin|plugins|migrate-installer) interactive=0 ;;
+esac
+for arg in "$@"; do
+  case "$arg" in
+    -p|--print|-v|--version|-h|--help) interactive=0 ;;
+  esac
+done
+
+auto_update_claude() {
+  if [[ "${CLAUDE_MOBILE_SKIP_UPDATE:-0}" == "1" ]] || \
+     [[ -n "$NATIVE_OVERRIDDEN" ]] || [[ ! -f "$RUNTIME" ]]; then
+    return
+  fi
+  # Network and registry failures must not prevent Claude Code from starting.
+  "$BASH" "$RUNTIME" update --if-due || \
+    printf '%s\n' 'Warning: Claude Code update check failed; starting the installed version.' >&2
+}
+
+# Bun, which Claude Code is built on, reads /etc/resolv.conf for DNS. Termux has
+# no such file, which makes Claude hang on "checking connectivity". Preload a
+# tiny script that gives Bun explicit resolvers. CLAUDE_MOBILE_DNS=off disables it.
+configure_dns() {
+  local servers="${CLAUDE_MOBILE_DNS-8.8.8.8,8.8.4.4}" preload json relative
+  [[ -z "$servers" || "$servers" == off ]] && return
+  if [[ ! "$servers" =~ ^[0-9A-Fa-f:.,]+$ ]]; then
+    printf 'Ignoring invalid CLAUDE_MOBILE_DNS value: %s\n' "$servers" >&2
+    return
+  fi
+  json="[\"${servers//,/\",\"}\"]"
+  preload="$CLAUDE_MOBILE_ROOT/setdns.js"
+  mkdir -p "$CLAUDE_MOBILE_ROOT"
+  printf 'try { require("dns").setServers(%s); } catch (e) {}\n' "$json" > "$preload"
+  # Bun resolves a relative preload from the working directory; using one avoids
+  # a harmless EACCES warning from its node_modules lookup on Android.
+  relative="$(realpath --relative-to="$PWD" "$preload" 2>/dev/null || true)"
+  case "$relative" in
+    ''|/*) relative="$preload" ;;
+    ./*|../*) ;;
+    *) relative="./$relative" ;;
+  esac
+  export BUN_OPTIONS="--preload $relative${BUN_OPTIONS:+ $BUN_OPTIONS}"
+}
+
+run_claude() {
+  if ((interactive)); then
+    auto_update_claude
+  fi
+
+  if [[ ! -x "$CLAUDE_MOBILE_NATIVE" ]]; then
+    printf 'Claude Code binary not found: %s\n' "$CLAUDE_MOBILE_NATIVE" >&2
+    printf '%s\n' 'Install it with: claude install   (or set CLAUDE_MOBILE_NATIVE to a binary path)' >&2
+    exit 1
+  fi
+
+  if ((interactive)) && command -v termux-wake-lock >/dev/null 2>&1; then
+    termux-wake-lock >/dev/null 2>&1 || true
+  fi
+
+  local claude_args=()
+  ((continue_last)) && claude_args+=(--continue)
+
+  export DISABLE_AUTOUPDATER=1
+  if [[ -z "${BROWSER:-}" ]] && command -v termux-open-url >/dev/null 2>&1; then
+    export BROWSER=termux-open-url
+  fi
+  configure_dns
+  # Termux preloads a Bionic library that crashes glibc programs.
+  unset LD_PRELOAD
+  exec "$CLAUDE_MOBILE_NATIVE" "${claude_args[@]}" "$@"
+}
+
+if ((!interactive)) || [[ -n "${TMUX:-}" ]] || \
+   [[ "${CLAUDE_MOBILE_NO_TMUX:-0}" == "1" ]]; then
+  run_claude "$@"
+fi
+
+if ! command -v tmux >/dev/null 2>&1; then
+  printf '%s\n' 'tmux is required. Install it with: pkg install tmux' >&2
+  exit 1
+fi
+
+if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
+  exec tmux attach-session -t "=$SESSION_NAME"
+fi
+
+# Inside the new session TMUX is set, so this script runs Claude directly.
+exec tmux new-session "${tmux_env[@]}" -s "$SESSION_NAME" -- \
+  "$SELF" "${launch_args[@]}"

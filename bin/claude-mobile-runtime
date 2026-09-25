@@ -1,0 +1,301 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Claude Mobile for Termux runtime manager.
+#
+# Claude Code ships as a glibc Linux binary, while Android uses Bionic. This
+# script downloads Anthropic's official linux-arm64 build, verifies it against
+# the published release manifest, points its ELF interpreter at the glibc loader
+# from Termux's glibc-runner package, and smoke-tests it before use. The previous
+# working version is kept, so a release that crashes on this device never
+# replaces one that works.
+set -Eeuo pipefail
+
+INSTALL_ROOT="${CLAUDE_MOBILE_ROOT:-$HOME/.local/claude-termux}"
+VERSIONS_DIR="$INSTALL_ROOT/versions"
+CURRENT_LINK="$INSTALL_ROOT/current"
+BLOCKLIST="$INSTALL_ROOT/blocklist"
+STAMP="$INSTALL_ROOT/last-update-check"
+LOCK_DIR="$INSTALL_ROOT/update.lock"
+RELEASES_URL="${CLAUDE_MOBILE_RELEASES_URL:-https://downloads.claude.ai/claude-code-releases}"
+PLATFORM='linux-arm64'
+GLIBC_LD="${CLAUDE_MOBILE_GLIBC_LD:-${PREFIX:-}/glibc/lib/ld-linux-aarch64.so.1}"
+PATCHELF="${CLAUDE_MOBILE_PATCHELF:-${PREFIX:-}/glibc/bin/patchelf}"
+UPDATE_CHANNEL="${CLAUDE_MOBILE_CHANNEL:-stable}"
+UPDATE_INTERVAL_HOURS="${CLAUDE_MOBILE_UPDATE_HOURS:-24}"
+QUERY_TIMEOUT="${CLAUDE_MOBILE_UPDATE_TIMEOUT:-10}"
+DOWNLOAD_TIMEOUT="${CLAUDE_MOBILE_DOWNLOAD_TIMEOUT:-900}"
+SMOKE_TIMEOUT="${CLAUDE_MOBILE_SMOKE_TIMEOUT:-45}"
+
+# Exit status used when a release is rejected because it crashes on this device.
+readonly EXIT_CRASHES=3
+
+usage() {
+  cat <<'EOF'
+Usage:
+  claude-mobile-runtime install [stable|latest|VERSION]
+  claude-mobile-runtime update [--force | --if-due]
+  claude-mobile-runtime status
+  claude-mobile-runtime path
+
+install  Download, verify, patch, and activate a Claude Code release.
+         Defaults to $CLAUDE_MOBILE_VERSION, or the stable channel.
+update   Activate the newest release on $CLAUDE_MOBILE_CHANNEL (default: stable).
+         --if-due checks at most once every $CLAUDE_MOBILE_UPDATE_HOURS hours.
+status   Show the active version and the update channel.
+path     Print the path of the active Claude Code binary.
+EOF
+}
+
+say() { printf '%s\n' "$*" >&2; }
+die() { say "claude-mobile-runtime: $*"; exit 1; }
+
+is_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+current_version() {
+  local target
+  target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+  target="${target##*/}"
+  if is_version "$target" && [[ -f "$VERSIONS_DIR/$target" ]]; then
+    printf '%s\n' "$target"
+  fi
+}
+
+is_blocklisted() { grep -qxF -- "$1" "$BLOCKLIST" 2>/dev/null; }
+
+require_tools() {
+  local tool
+  for tool in curl jq sha256sum timeout; do
+    command -v "$tool" >/dev/null 2>&1 || \
+      die "$tool is required. Install it with: pkg install ${tool/sha256sum/coreutils}"
+  done
+  [[ -f "$GLIBC_LD" ]] || \
+    die "glibc loader not found at $GLIBC_LD. Install it with: pkg install glibc-repo && pkg update && pkg install glibc-runner patchelf-glibc"
+  [[ -x "$PATCHELF" ]] || \
+    die "patchelf not found at $PATCHELF. Install it with: pkg install patchelf-glibc"
+}
+
+fetch() {
+  curl -fsSL --connect-timeout "$QUERY_TIMEOUT" --max-time "$((QUERY_TIMEOUT * 3))" "$1"
+}
+
+# Print the version number for a channel name or an explicit version.
+resolve_version() {
+  local spec="$1" version
+  if is_version "$spec"; then
+    printf '%s\n' "$spec"
+    return
+  fi
+  case "$spec" in
+    stable|latest) ;;
+    *)
+      say "claude-mobile-runtime: unknown version or channel: $spec (use stable, latest, or X.Y.Z)"
+      return 1
+      ;;
+  esac
+  version="$(fetch "$RELEASES_URL/$spec" 2>/dev/null | tr -d '[:space:]' || true)"
+  if ! is_version "$version"; then
+    say "claude-mobile-runtime: could not look up the $spec release; check the connection."
+    return 1
+  fi
+  printf '%s\n' "$version"
+}
+
+# Return 0 if the binary starts, 1 if it definitely crashes on this device, and
+# 2 if the result is inconclusive (for example, a slow phone hit the timeout).
+# Some releases pass --version but crash on a full start (an Android seccomp
+# filter rejecting a syscall, for example), so the probe boots the runtime with
+# --init-only in an isolated HOME that never touches the user's ~/.claude.
+smoke_test() {
+  local binary="$1" probe_home err started elapsed status=0
+  probe_home="$(mktemp -d "${TMPDIR:-/tmp}/claude-mobile-probe.XXXXXX")"
+  err="$probe_home/stderr"
+  mkdir -p "$probe_home/.claude"
+  started="$(date +%s)"
+  HOME="$probe_home" LD_PRELOAD='' DISABLE_AUTOUPDATER=1 \
+    timeout -s KILL "$SMOKE_TIMEOUT" "$binary" --init-only \
+    </dev/null >/dev/null 2>"$err" || status=$?
+  elapsed=$(( $(date +%s) - started ))
+
+  local result=0
+  if grep -qE 'Bad system call|oh no: Bun has crashed|panic\(|bun\.report' "$err" 2>/dev/null; then
+    result=1
+  elif ((elapsed >= SMOKE_TIMEOUT)); then
+    result=2
+  elif ((status > 128 && status < 160)); then
+    result=1
+  elif ((status == 126 || status == 127)); then
+    result=2
+  fi
+  # Any other non-zero status (for example, an unknown flag) is not a crash.
+  rm -rf "$probe_home"
+  return "$result"
+}
+
+# Point "current" at a version, keeping it and the previously active version.
+activate() {
+  local version="$1" previous entry name
+  previous="$(current_version)"
+  ln -sfn "versions/$version" "$CURRENT_LINK"
+  for entry in "$VERSIONS_DIR"/*; do
+    name="${entry##*/}"
+    is_version "$name" || continue
+    [[ "$name" == "$version" || "$name" == "$previous" ]] && continue
+    rm -f -- "$entry"
+  done
+}
+
+install_version() {
+  local version="$1" manifest checksum size actual tmp probe=0
+  local target="$VERSIONS_DIR/$version"
+  mkdir -p "$VERSIONS_DIR"
+
+  if [[ -f "$target" ]]; then
+    activate "$version"
+    say "Claude Code $version is active."
+    return
+  fi
+
+  manifest="$(fetch "$RELEASES_URL/$version/manifest.json")" || \
+    die "could not download the release manifest for $version."
+  checksum="$(jq -er --arg p "$PLATFORM" '.platforms[$p].checksum' <<<"$manifest" 2>/dev/null)" || \
+    die "the $version manifest has no $PLATFORM checksum."
+  size="$(jq -r --arg p "$PLATFORM" '.platforms[$p].size // 0' <<<"$manifest" 2>/dev/null || echo 0)"
+  [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || die "the $version manifest has an invalid checksum."
+
+  tmp="$VERSIONS_DIR/.download.$$"
+  # shellcheck disable=SC2064  # Expand now: the path is fixed for this process.
+  trap "rm -f -- '$tmp'" EXIT
+
+  local size_note=''
+  [[ "$size" =~ ^[0-9]+$ ]] && ((size > 0)) && size_note=" ($((size / 1048576)) MB)"
+  say "Downloading Claude Code $version for $PLATFORM$size_note..."
+  local progress=(-sS)
+  [[ -t 2 ]] && progress=(--progress-bar)
+  curl -fL "${progress[@]}" --retry 2 --connect-timeout 20 \
+    --max-time "$DOWNLOAD_TIMEOUT" -o "$tmp" \
+    "$RELEASES_URL/$version/$PLATFORM/claude" || die "download of $version failed."
+
+  actual="$(sha256sum "$tmp" | cut -d' ' -f1)"
+  [[ "$actual" == "$checksum" ]] || \
+    die "checksum mismatch for $version (expected $checksum, got $actual)."
+
+  chmod 755 "$tmp"
+  LD_PRELOAD='' "$PATCHELF" --set-interpreter "$GLIBC_LD" "$tmp" || \
+    die "patchelf could not patch the $version binary."
+
+  say "Checking that Claude Code $version starts on this device..."
+  smoke_test "$tmp" || probe=$?
+  if ((probe == 1)); then
+    printf '%s\n' "$version" >> "$BLOCKLIST"
+    say "Claude Code $version crashes on this device, so it was not activated."
+    say "Install an older release instead, for example: claude-mobile-runtime install 2.1.112"
+    return "$EXIT_CRASHES"
+  elif ((probe == 2)); then
+    say "Warning: could not fully verify $version (the start-up probe timed out); activating it anyway."
+  fi
+
+  mv -f -- "$tmp" "$target"
+  trap - EXIT
+  activate "$version"
+  say "Claude Code $version is installed and active."
+}
+
+# Run install_version in a subshell so its EXIT trap stays local, and store its
+# status in INSTALL_STATUS. It must never be called from an "if" or "||" list:
+# Bash ignores errexit inside functions called from those contexts.
+INSTALL_STATUS=0
+run_install() {
+  set +e
+  (set -e; install_version "$1")
+  INSTALL_STATUS=$?
+  set -e
+}
+
+acquire_lock() {
+  local age
+  mkdir -p "$INSTALL_ROOT"
+  if [[ -d "$LOCK_DIR" ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0) ))
+    ((age < 900)) || rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  mkdir "$LOCK_DIR" 2>/dev/null
+}
+
+release_lock() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
+
+cmd_install() {
+  local spec="${1:-${CLAUDE_MOBILE_VERSION:-stable}}" version
+  require_tools
+  version="$(resolve_version "$spec")" || exit 1
+  acquire_lock || die 'another Claude Code update is already running.'
+  # An explicit install is a request to retry, even for a blocklisted version.
+  if [[ -f "$BLOCKLIST" ]]; then
+    grep -vxF -- "$version" "$BLOCKLIST" > "$BLOCKLIST.tmp" || true
+    mv -f -- "$BLOCKLIST.tmp" "$BLOCKLIST"
+  fi
+  run_install "$version"
+  release_lock
+  touch "$STAMP"
+  return "$INSTALL_STATUS"
+}
+
+cmd_update() {
+  local mode="${1:-}" version current status=0
+  case "$mode" in
+    ''|--force|--if-due) ;;
+    *) die "unknown update option: $mode" ;;
+  esac
+
+  if [[ "$mode" == --if-due && -f "$STAMP" ]]; then
+    local age=$(( $(date +%s) - $(stat -c %Y "$STAMP" 2>/dev/null || echo 0) ))
+    ((age < UPDATE_INTERVAL_HOURS * 3600)) && return 0
+  fi
+
+  require_tools
+  if ! acquire_lock; then
+    [[ "$mode" == --if-due ]] && return 0
+    die 'another Claude Code update is already running.'
+  fi
+  touch "$STAMP"
+
+  if ! version="$(resolve_version "$UPDATE_CHANNEL")"; then
+    release_lock
+    say "Using the installed Claude Code version."
+    return 1
+  fi
+  current="$(current_version)"
+
+  if [[ "$version" == "$current" ]]; then
+    [[ "$mode" == --if-due ]] || say "Claude Code $current is up to date ($UPDATE_CHANNEL channel)."
+  elif is_blocklisted "$version"; then
+    say "Skipping Claude Code $version: it crashed on this device earlier."
+  else
+    say "Updating Claude Code${current:+ from $current} to $version..."
+    run_install "$version"
+    status="$INSTALL_STATUS"
+  fi
+  release_lock
+  return "$status"
+}
+
+cmd_status() {
+  local current
+  current="$(current_version)"
+  printf 'Active version: %s\n' "${current:-none}"
+  printf 'Update channel: %s\n' "$UPDATE_CHANNEL"
+  printf 'Install root:   %s\n' "$INSTALL_ROOT"
+  [[ -n "$current" ]]
+}
+
+cmd_path() {
+  [[ -n "$(current_version)" ]] || die 'Claude Code is not installed; run: claude-mobile-runtime install'
+  printf '%s\n' "$CURRENT_LINK"
+}
+
+case "${1:-}" in
+  install) shift; (($# <= 1)) || die 'install takes at most one version.'; cmd_install "$@" ;;
+  update) shift; (($# <= 1)) || die 'update takes at most one option.'; cmd_update "$@" ;;
+  status) cmd_status ;;
+  path) cmd_path ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
