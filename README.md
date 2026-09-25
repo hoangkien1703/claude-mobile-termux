@@ -50,16 +50,27 @@ Optional integrations:
 
 ## Install
 
-Install Node.js and Git in Termux, then run the installer directly from GitHub:
+In Termux, install Node.js and Git, install this package with npm, then run its
+installer:
 
 ```bash
 pkg update
 pkg install -y nodejs-lts git
-npx --yes github:hoangkien1703/claude-mobile-termux
+npm install --global github:hoangkien1703/claude-mobile-termux
+claude-mobile-termux
 ```
 
-The npm command explicitly runs the installer. Installing this package as a
-project dependency does not modify your Termux environment.
+`npm install` only adds the `claude-mobile-termux` command. Running that command
+does the real setup, which downloads about 270 MB (Claude Code plus the glibc
+packages) and shows its progress. It is a separate step on purpose: npm hides
+the output of install hooks, so a long download inside `npm install` would look
+frozen.
+
+To do both steps at once without keeping the command installed:
+
+```bash
+npx --yes github:hoangkien1703/claude-mobile-termux
+```
 
 You can also clone the repository and run the shell installer directly:
 
@@ -196,10 +207,12 @@ CLAUDE_MOBILE_UPDATE_HOURS=168 claude    # check once a week
 To keep a setting, add an `export` line for it to `~/.bashrc`. On mobile data,
 the stable channel and a longer check interval use the least data.
 
-To update the launcher scripts themselves, run the installer again:
+To update the launcher scripts themselves, reinstall the package and run the
+installer again:
 
 ```bash
-npx --yes github:hoangkien1703/claude-mobile-termux
+npm install --global github:hoangkien1703/claude-mobile-termux
+claude-mobile-termux
 ```
 
 For a Git clone:
@@ -216,13 +229,14 @@ Remove the commands and Widget shortcuts, but keep the downloaded Claude Code
 binaries:
 
 ```bash
-npx --yes github:hoangkien1703/claude-mobile-termux uninstall
+claude-mobile-termux uninstall
 ```
 
-Remove the commands, shortcuts, and downloaded binaries:
+Remove the commands, shortcuts, and downloaded binaries, then the npm package:
 
 ```bash
-npx --yes github:hoangkien1703/claude-mobile-termux uninstall --purge
+claude-mobile-termux uninstall --purge
+npm uninstall --global claude-mobile-termux
 ```
 
 From a Git clone, use `./uninstall.sh` or `./uninstall.sh --purge`.
