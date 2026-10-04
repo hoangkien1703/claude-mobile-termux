@@ -9,7 +9,7 @@ set -Eeuo pipefail
 tmux_env=()
 for name in CLAUDE_MOBILE_NATIVE CLAUDE_MOBILE_ROOT CLAUDE_MOBILE_RUNTIME \
   CLAUDE_MOBILE_DNS CLAUDE_MOBILE_SKIP_UPDATE CLAUDE_MOBILE_CHANNEL \
-  CLAUDE_MOBILE_UPDATE_HOURS CLAUDE_MOBILE_UPDATE_TIMEOUT \
+  CLAUDE_MOBILE_UPDATE_HOURS CLAUDE_MOBILE_UPDATE_TIMEOUT CLAUDE_MOBILE_UPDATE_WAIT \
   CLAUDE_MOBILE_DOWNLOAD_TIMEOUT CLAUDE_MOBILE_SMOKE_TIMEOUT; do
   if [[ -n "${!name+x}" ]]; then
     tmux_env+=(-e "$name=${!name}")
@@ -77,8 +77,27 @@ auto_update_claude() {
     return
   fi
   # Network and registry failures must not prevent Claude Code from starting.
-  "$BASH" "$RUNTIME" update --if-due || \
-    printf '%s\n' 'Warning: Claude Code update check failed; starting the installed version.' >&2
+  if [[ "${CLAUDE_MOBILE_UPDATE_WAIT:-0}" == "1" ]] || [[ ! -x "$CLAUDE_MOBILE_NATIVE" ]]; then
+    "$BASH" "$RUNTIME" update --if-due || \
+      printf '%s\n' 'Warning: Claude Code update check failed; starting the installed version.' >&2
+    return
+  fi
+  # Check for a new release in the background, so starting Claude never waits
+  # for a download. A new release is used from the next start. nohup keeps the
+  # download going after the tmux session or Termux window closes.
+  local log="$CLAUDE_MOBILE_ROOT/update.log" size
+  mkdir -p "$CLAUDE_MOBILE_ROOT"
+  size="$(stat -c %s "$log" 2>/dev/null || echo 0)"
+  ((size < 65536)) || : > "$log"
+  nohup "$BASH" "$RUNTIME" update --if-due </dev/null >>"$log" 2>&1 &
+}
+
+# Report what a background update did since the last start.
+show_update_notice() {
+  local notice="$CLAUDE_MOBILE_ROOT/update-notice"
+  [[ -f "$notice" ]] || return 0
+  cat -- "$notice" >&2 || true
+  rm -f -- "$notice"
 }
 
 # Bun, which Claude Code is built on, reads /etc/resolv.conf for DNS. Termux has
@@ -108,6 +127,7 @@ configure_dns() {
 
 run_claude() {
   if ((interactive)); then
+    show_update_notice
     auto_update_claude
   fi
 

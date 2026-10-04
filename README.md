@@ -72,6 +72,9 @@ To do both steps at once without keeping the command installed:
 npx --yes github:hoangkien1703/claude-mobile-termux
 ```
 
+Run `npx` only to install or reinstall. It fetches the package from GitHub and
+runs the whole installer every time, so start Claude with `claude` afterwards.
+
 You can also clone the repository and run the shell installer directly:
 
 ```bash
@@ -181,10 +184,14 @@ optimization for Termux in Android settings.
 
 ## Updates
 
-Once a day, starting Claude checks the stable channel for a new release. When
-one is available, it is downloaded (about 220 MB), verified, patched, and tested
-before Claude starts. If the check fails or times out, the installed version
-starts as usual.
+Claude Code is downloaded once and reused on every start. Once a day, starting
+Claude checks the stable channel for a new release **in the background**, so
+Claude opens straight away with the installed version. When a new release is
+out, it is downloaded (about 220 MB), verified, patched, and tested in the
+background, and Claude uses it from the next start, which shows a one-line
+notice. If you are offline, the check is skipped and tried again at the next
+start. An interrupted download (for example, if you close Termux) resumes where
+it stopped instead of starting over.
 
 Claude Code's built-in updater is turned off, because it would install an
 unpatched build that cannot run in Termux. Use these commands instead:
@@ -202,7 +209,10 @@ Settings for updates:
 CLAUDE_MOBILE_SKIP_UPDATE=1 claude       # skip the check this time
 CLAUDE_MOBILE_CHANNEL=latest claude      # follow the newest releases
 CLAUDE_MOBILE_UPDATE_HOURS=168 claude    # check once a week
+CLAUDE_MOBILE_UPDATE_WAIT=1 claude       # finish the update before starting
 ```
+
+The background update writes its output to `~/.local/claude-termux/update.log`.
 
 To keep a setting, add an `export` line for it to `~/.bashrc`. On mobile data,
 the stable channel and a longer check interval use the least data.
@@ -247,6 +257,26 @@ packages also remain. Remove them with `pkg uninstall` if nothing else uses
 them.
 
 ## Troubleshooting
+
+### Claude Code downloads again every time I start it
+
+Check which `claude` command runs and what is installed:
+
+```bash
+readlink -f "$(command -v claude)"   # should end in /bin/claude-mobile
+claude-mobile-runtime status         # should show an active version
+ls -lh ~/.local/claude-termux/versions
+```
+
+- If the first command prints a path inside `node_modules`, another
+  installation (such as `npm install -g @anthropic-ai/claude-code`) replaced
+  the launcher.
+  Run `claude-mobile-termux` again to restore it.
+- If you start Claude with `npx github:hoangkien1703/claude-mobile-termux`,
+  use `claude` instead: `npx` runs the full installer each time.
+- Versions older than this one waited for each update, and a download that was
+  interrupted started again from zero. Update the launcher (see
+  [Updates](#updates)) so updates run in the background and resume.
 
 ### A new version crashes on my phone
 

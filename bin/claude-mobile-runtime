@@ -14,6 +14,7 @@ VERSIONS_DIR="$INSTALL_ROOT/versions"
 CURRENT_LINK="$INSTALL_ROOT/current"
 BLOCKLIST="$INSTALL_ROOT/blocklist"
 STAMP="$INSTALL_ROOT/last-update-check"
+NOTICE="$INSTALL_ROOT/update-notice"
 LOCK_DIR="$INSTALL_ROOT/update.lock"
 RELEASES_URL="${CLAUDE_MOBILE_RELEASES_URL:-https://downloads.claude.ai/claude-code-releases}"
 PLATFORM='linux-arm64'
@@ -27,6 +28,8 @@ SMOKE_TIMEOUT="${CLAUDE_MOBILE_SMOKE_TIMEOUT:-45}"
 
 # Exit status used when a release is rejected because it crashes on this device.
 readonly EXIT_CRASHES=3
+# Exit status used when a download fails; the partial file is kept for resuming.
+readonly EXIT_DOWNLOAD=4
 
 usage() {
   cat <<'EOF'
@@ -143,10 +146,39 @@ activate() {
   done
 }
 
+# Download a release binary to a partial file. A partial file left by an
+# interrupted attempt (a closed Termux session, a lost connection, a timeout) is
+# resumed, so a slow connection never restarts a 220 MB download from zero.
+download_release() {
+  local url="$1" dest="$2" size="$3" have=0
+  if [[ -f "$dest" ]]; then
+    have="$(stat -c %s "$dest" 2>/dev/null || echo 0)"
+    if [[ "$size" =~ ^[0-9]+$ ]] && ((size > 0 && have == size)); then
+      return 0
+    fi
+  fi
+  local progress=(-sS)
+  [[ -t 2 ]] && progress=(--progress-bar)
+  if ((have > 0)); then
+    say "Resuming the download at $((have / 1048576)) MB..."
+    curl -fL "${progress[@]}" --retry 2 --connect-timeout 20 \
+      --max-time "$DOWNLOAD_TIMEOUT" -C - -o "$dest" "$url" && return 0
+    # The partial file may be unusable (for example, the server ignored the
+    # range request), so start again once from the beginning.
+    rm -f -- "$dest"
+  fi
+  curl -fL "${progress[@]}" --retry 2 --connect-timeout 20 \
+    --max-time "$DOWNLOAD_TIMEOUT" -o "$dest" "$url"
+}
+
 install_version() {
-  local version="$1" manifest checksum size actual tmp probe=0
+  local version="$1" manifest checksum size actual probe=0
   local target="$VERSIONS_DIR/$version"
+  local partial="$VERSIONS_DIR/.download.$version"
+  local staging="$partial.staging"
   mkdir -p "$VERSIONS_DIR"
+  # The update lock is held, so any staging file was left by an interrupted run.
+  rm -f -- "$VERSIONS_DIR"/.download.*.staging
 
   if [[ -f "$target" ]]; then
     activate "$version"
@@ -161,29 +193,30 @@ install_version() {
   size="$(jq -r --arg p "$PLATFORM" '.platforms[$p].size // 0' <<<"$manifest" 2>/dev/null || echo 0)"
   [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || die "the $version manifest has an invalid checksum."
 
-  tmp="$VERSIONS_DIR/.download.$$"
   # shellcheck disable=SC2064  # Expand now: the path is fixed for this process.
-  trap "rm -f -- '$tmp'" EXIT
+  trap "rm -f -- '$staging'" EXIT
 
   local size_note=''
   [[ "$size" =~ ^[0-9]+$ ]] && ((size > 0)) && size_note=" ($((size / 1048576)) MB)"
   say "Downloading Claude Code $version for $PLATFORM$size_note..."
-  local progress=(-sS)
-  [[ -t 2 ]] && progress=(--progress-bar)
-  curl -fL "${progress[@]}" --retry 2 --connect-timeout 20 \
-    --max-time "$DOWNLOAD_TIMEOUT" -o "$tmp" \
-    "$RELEASES_URL/$version/$PLATFORM/claude" || die "download of $version failed."
+  if ! download_release "$RELEASES_URL/$version/$PLATFORM/claude" "$partial" "$size"; then
+    say "claude-mobile-runtime: download of $version failed; the next attempt resumes it."
+    exit "$EXIT_DOWNLOAD"
+  fi
 
-  actual="$(sha256sum "$tmp" | cut -d' ' -f1)"
-  [[ "$actual" == "$checksum" ]] || \
+  actual="$(sha256sum "$partial" | cut -d' ' -f1)"
+  if [[ "$actual" != "$checksum" ]]; then
+    rm -f -- "$partial"
     die "checksum mismatch for $version (expected $checksum, got $actual)."
+  fi
+  mv -f -- "$partial" "$staging"
 
-  chmod 755 "$tmp"
-  LD_PRELOAD='' "$PATCHELF" --set-interpreter "$GLIBC_LD" "$tmp" || \
+  chmod 755 "$staging"
+  LD_PRELOAD='' "$PATCHELF" --set-interpreter "$GLIBC_LD" "$staging" || \
     die "patchelf could not patch the $version binary."
 
   say "Checking that Claude Code $version starts on this device..."
-  smoke_test "$tmp" || probe=$?
+  smoke_test "$staging" || probe=$?
   if ((probe == 1)); then
     printf '%s\n' "$version" >> "$BLOCKLIST"
     say "Claude Code $version crashes on this device, so it was not activated."
@@ -193,8 +226,10 @@ install_version() {
     say "Warning: could not fully verify $version (the start-up probe timed out); activating it anyway."
   fi
 
-  mv -f -- "$tmp" "$target"
+  mv -f -- "$staging" "$target"
   trap - EXIT
+  # Partial downloads of other versions are no longer needed.
+  rm -f -- "$VERSIONS_DIR"/.download.*
   activate "$version"
   say "Claude Code $version is installed and active."
 }
@@ -210,17 +245,34 @@ run_install() {
   set -e
 }
 
+# The lock records its owner, so a lock left by a run that was killed (for
+# example, when Android stopped Termux mid-download) does not block updates.
 acquire_lock() {
-  local age
+  local owner age
   mkdir -p "$INSTALL_ROOT"
-  if [[ -d "$LOCK_DIR" ]]; then
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
     age=$(( $(date +%s) - $(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0) ))
-    ((age < 900)) || rmdir "$LOCK_DIR" 2>/dev/null || true
+    if [[ "$owner" =~ ^[0-9]+$ ]]; then
+      kill -0 "$owner" 2>/dev/null && ((age < 7200)) && return 1
+    else
+      # The owner may still be writing its PID.
+      ((age < 60)) && return 1
+    fi
+    rm -rf -- "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
   fi
-  mkdir "$LOCK_DIR" 2>/dev/null
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  trap release_lock EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 }
 
-release_lock() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
+release_lock() {
+  [[ "$(cat "$LOCK_DIR/pid" 2>/dev/null || true)" == "$$" ]] && rm -rf -- "$LOCK_DIR"
+  return 0
+}
 
 cmd_install() {
   local spec="${1:-${CLAUDE_MOBILE_VERSION:-stable}}" version
@@ -255,8 +307,8 @@ cmd_update() {
     [[ "$mode" == --if-due ]] && return 0
     die 'another Claude Code update is already running.'
   fi
-  touch "$STAMP"
 
+  # Offline: leave the check due, so the next start tries again.
   if ! version="$(resolve_version "$UPDATE_CHANNEL")"; then
     release_lock
     say "Using the installed Claude Code version."
@@ -265,13 +317,27 @@ cmd_update() {
   current="$(current_version)"
 
   if [[ "$version" == "$current" ]]; then
+    touch "$STAMP"
     [[ "$mode" == --if-due ]] || say "Claude Code $current is up to date ($UPDATE_CHANNEL channel)."
   elif is_blocklisted "$version"; then
+    touch "$STAMP"
     say "Skipping Claude Code $version: it crashed on this device earlier."
   else
     say "Updating Claude Code${current:+ from $current} to $version..."
     run_install "$version"
     status="$INSTALL_STATUS"
+    if [[ "$mode" == --if-due ]]; then
+      case "$status" in
+        0) printf 'Claude Code was updated to %s.\n' "$version" > "$NOTICE" ;;
+        "$EXIT_CRASHES")
+          printf 'Claude Code %s crashes on this device, so %s stays active.\n' \
+            "$version" "${current:-the installed version}" > "$NOTICE"
+          ;;
+      esac
+    fi
+    # Until the download completes, every start retries it, resuming where the
+    # last attempt stopped (even one killed with Termux).
+    ((status == EXIT_DOWNLOAD)) || touch "$STAMP"
   fi
   release_lock
   return "$status"
@@ -283,6 +349,10 @@ cmd_status() {
   printf 'Active version: %s\n' "${current:-none}"
   printf 'Update channel: %s\n' "$UPDATE_CHANNEL"
   printf 'Install root:   %s\n' "$INSTALL_ROOT"
+  if [[ -f "$STAMP" ]]; then
+    printf 'Last check:     %s\n' "$(date -r "$STAMP" '+%Y-%m-%d %H:%M')"
+  fi
+  [[ -d "$LOCK_DIR" ]] && printf '%s\n' 'An update is running in the background.'
   [[ -n "$current" ]]
 }
 
