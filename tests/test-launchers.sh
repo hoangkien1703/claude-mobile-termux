@@ -174,16 +174,51 @@ run_launcher install 2.1.112
 assert_log 'runtime:install 2.1.112'
 refute_log_contains 'native:'
 
-# The managed binary is updated (when due) before an interactive launch.
+# Wait briefly for a background update check to record its call.
+wait_for_log() {
+  local tries=0
+  until grep -F -x -- "$1" "$LOG" >/dev/null; do
+    ((++tries < 50)) || { show_log; fail "missing background log line: $1"; }
+    sleep 0.1
+  done
+}
+
+# An interactive launch checks for updates in the background, so Claude starts
+# straight away with the installed version.
 MANAGED_ROOT="$TEST_HOME/.local/claude-termux"
 mkdir -p "$MANAGED_ROOT/versions"
 cp "$NATIVE" "$MANAGED_ROOT/versions/1.0.0"
 ln -sfn versions/1.0.0 "$MANAGED_ROOT/current"
 
+cat > "$RUNTIME" <<'EOF'
+#!/usr/bin/env bash
+sleep 0.5
+printf 'runtime:%s\n' "$*" >> "$LOG"
+EOF
 : > "$LOG"
 TMUX=inside run_launcher
-assert_log 'runtime:update --if-due'
 assert_log 'native:'
+refute_log_contains 'runtime:'
+wait_for_log 'runtime:update --if-due'
+
+cat > "$RUNTIME" <<'EOF'
+#!/usr/bin/env bash
+printf 'runtime:%s\n' "$*" >> "$LOG"
+EOF
+
+# CLAUDE_MOBILE_UPDATE_WAIT finishes the check before Claude starts.
+: > "$LOG"
+TMUX=inside CLAUDE_MOBILE_UPDATE_WAIT=1 run_launcher
+[[ "$(head -n 1 "$LOG")" == 'runtime:update --if-due' ]] || \
+  { show_log; fail 'update did not run before Claude with CLAUDE_MOBILE_UPDATE_WAIT=1'; }
+assert_log 'native:'
+
+# A notice left by a background update is shown once at the next start.
+printf '%s\n' 'Claude Code was updated to 1.1.0.' > "$MANAGED_ROOT/update-notice"
+: > "$LOG"
+TMUX=inside CLAUDE_MOBILE_SKIP_UPDATE=1 run_launcher 2>"$TEST_ROOT/err"
+grep -F 'updated to 1.1.0' "$TEST_ROOT/err" >/dev/null || fail 'update notice was not shown'
+[[ ! -e "$MANAGED_ROOT/update-notice" ]] || fail 'update notice was shown more than once'
 
 : > "$LOG"
 TMUX=inside CLAUDE_MOBILE_SKIP_UPDATE=1 run_launcher
@@ -203,7 +238,7 @@ printf 'runtime:%s\n' "$*" >> "$LOG"
 exit 1
 EOF
 : > "$LOG"
-TMUX=inside run_launcher 2>/dev/null
+TMUX=inside CLAUDE_MOBILE_UPDATE_WAIT=1 run_launcher 2>/dev/null
 assert_log 'native:'
 
 # A missing binary fails with a clear message.

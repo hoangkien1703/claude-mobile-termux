@@ -54,6 +54,7 @@ runtime() {
 }
 
 active() { readlink "$ROOT/current" 2>/dev/null || true; }
+checked_recently() { [[ -n "$(find "$ROOT/last-update-check" -mmin -60 2>/dev/null)" ]]; }
 
 publish 1.0.0
 publish 1.1.0
@@ -126,6 +127,55 @@ runtime update --if-due 2>/dev/null
 touch -d '2 days ago' "$ROOT/last-update-check"
 runtime update --if-due 2>/dev/null
 [[ "$(active)" == versions/1.1.0 ]] || fail '--if-due did not update after the interval'
+grep -F 'updated to 1.1.0' "$ROOT/update-notice" >/dev/null || \
+  fail 'automatic update did not leave a notice for the next start'
+rm -f "$ROOT/update-notice"
+
+# An interrupted download is resumed instead of starting again.
+publish 1.5.0
+head -c 20 "$RELEASES/1.5.0/linux-arm64/claude" > "$ROOT/versions/.download.1.5.0"
+runtime install 1.5.0 2>"$TEST_ROOT/err"
+[[ "$(active)" == versions/1.5.0 ]] || fail 'resumed download not activated'
+grep -F 'Resuming' "$TEST_ROOT/err" >/dev/null || fail 'partial download was not resumed'
+[[ -z "$(find "$ROOT/versions" -name '.download.*')" ]] || fail 'resumed download left temporary files'
+
+# A corrupt partial download is discarded after the checksum check fails.
+publish 1.6.0
+printf 'garbage' > "$ROOT/versions/.download.1.6.0"
+if runtime install 1.6.0 2>/dev/null; then
+  fail 'corrupt partial download should fail the checksum'
+fi
+[[ ! -e "$ROOT/versions/.download.1.6.0" ]] || fail 'corrupt partial download was kept'
+runtime install 1.6.0 2>/dev/null
+[[ "$(active)" == versions/1.6.0 ]] || fail 'retry after a corrupt partial download failed'
+
+# A failed download keeps the update due, so the next start resumes it.
+publish 1.7.0
+rm "$RELEASES/1.7.0/linux-arm64/claude"
+set_channel stable 1.7.0
+touch -d '2 days ago' "$ROOT/last-update-check"
+status=0
+runtime update --if-due 2>/dev/null || status=$?
+((status == 4)) || fail "failed download returned status $status instead of 4"
+checked_recently && fail 'failed download postponed the next attempt'
+[[ "$(active)" == versions/1.6.0 ]] || fail 'failed download changed the active version'
+set_channel stable 1.6.0
+
+# A lock held by a running update makes automatic checks step aside.
+mkdir "$ROOT/update.lock"
+printf '%s\n' "$$" > "$ROOT/update.lock/pid"
+: > "$LOG"
+runtime update --if-due 2>/dev/null || fail '--if-due should not fail while another update runs'
+checked_recently && fail '--if-due ran while another update held the lock'
+if runtime update 2>/dev/null; then
+  fail 'a forced update should report the running update'
+fi
+
+# A lock left by a killed update is taken over.
+printf '%s\n' 999999 > "$ROOT/update.lock/pid"
+runtime update 2>/dev/null || fail 'stale lock blocked the update'
+[[ ! -e "$ROOT/update.lock" ]] || fail 'update did not release its lock'
+checked_recently || fail 'successful check did not record its time'
 
 # Unreachable release servers fail without touching the active version.
 if HOME="$HOME_DIR" CLAUDE_MOBILE_RELEASES_URL="file://$TEST_ROOT/missing" \
@@ -133,7 +183,14 @@ if HOME="$HOME_DIR" CLAUDE_MOBILE_RELEASES_URL="file://$TEST_ROOT/missing" \
   bash "$RUNTIME" update 2>/dev/null; then
   fail 'unreachable release server should fail the update'
 fi
-[[ "$(active)" == versions/1.1.0 ]] || fail 'network failure changed the active version'
+[[ "$(active)" == versions/1.6.0 ]] || fail 'network failure changed the active version'
+
+# Offline checks stay due, so the next start tries again.
+rm -f "$ROOT/last-update-check"
+HOME="$HOME_DIR" CLAUDE_MOBILE_RELEASES_URL="file://$TEST_ROOT/missing" \
+  CLAUDE_MOBILE_GLIBC_LD="$GLIBC_LD" CLAUDE_MOBILE_PATCHELF="$TEST_ROOT/glibc/bin/patchelf" \
+  bash "$RUNTIME" update --if-due 2>/dev/null || true
+[[ ! -e "$ROOT/last-update-check" ]] || fail 'offline check postponed the next attempt'
 
 # Missing glibc-runner is reported before any download.
 if HOME="$HOME_DIR" CLAUDE_MOBILE_RELEASES_URL="file://$RELEASES" \
